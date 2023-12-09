@@ -65,6 +65,7 @@ static inline PyObject*
 _PyObject_INIT(PyObject *op, PyTypeObject *typeobj)
 {
     assert(op != NULL);
+    op->hotness = 0;
     Py_SET_TYPE(op, typeobj);
     if (PyType_GetFlags(typeobj) & Py_TPFLAGS_HEAPTYPE) {
         Py_INCREF(typeobj);
