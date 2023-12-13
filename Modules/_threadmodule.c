@@ -1283,7 +1283,6 @@ t_bootstrap(void *boot_raw)
 
     tstate = boot->tstate;
     tstate->thread_id = PyThread_get_thread_ident();
-    fprintf(stderr, "new thread id: %ul\n", tstate->thread_id);
     _PyThreadState_Init(tstate);
     PyEval_AcquireThread(tstate);
     _Py_atomic_add_ssize(&tstate->interp->num_threads, 1);

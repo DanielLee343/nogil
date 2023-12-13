@@ -55,6 +55,8 @@
 
 #include "mimalloc.h"
 #include "mimalloc-internal.h"
+#include "mimalloc-atomic.h"
+#include <string.h>
 volatile short terminate_flag_refchain = 0;
 typedef struct _gc_runtime_state GCState;
 
@@ -2379,7 +2381,7 @@ void gc_get_objects_impl_op_gc(Py_ssize_t generation, op_gc_table *table)
     struct gc_get_objects_arg_op_gc arg;
     arg.table = table;
     arg.generation = generation + 1;
-    if (visit_heap_none_gc(gc_get_objects_visitor_op_gc, &arg) < 0)
+    if (visit_heap(gc_get_objects_visitor_op_gc, &arg) < 0)
     {
         fprintf(stderr, "failed during visit_heap\n");
         goto error;
@@ -2909,6 +2911,183 @@ void update_recursive_tuple(PyObject *each_op, cur_heats_table *table)
     }
 }
 
+typedef struct mi_visit_blocks_args_s
+{
+    bool visit_blocks;
+    mi_block_visit_fun *visitor;
+    void *arg;
+} mi_visit_blocks_args_t;
+typedef struct mi_heap_area_ex_s
+{
+    mi_heap_area_t area;
+    mi_page_t *page;
+} mi_heap_area_ex_t;
+
+static bool mi_heap_area_visit_blocks(const mi_heap_area_ex_t *xarea, mi_block_visit_fun *visitor, void *arg)
+{
+    mi_assert(xarea != NULL);
+    if (xarea == NULL)
+        return true;
+    const mi_heap_area_t *area = &xarea->area;
+    mi_page_t *page = xarea->page;
+    mi_assert(page != NULL);
+    if (page == NULL)
+        return true;
+
+    _mi_page_free_collect(page, true);
+    mi_assert_internal(page->local_free == NULL);
+    if (page->used == 0)
+        return true;
+
+    const size_t bsize = mi_page_block_size(page);
+    size_t psize;
+    uint8_t *pstart = _mi_page_start(_mi_page_segment(page), page, &psize);
+
+    if (page->capacity == 1)
+    {
+        // optimize page with one block
+        mi_assert_internal(page->used == 1 && page->free == NULL);
+        return visitor(mi_page_heap(page), area, pstart, bsize, arg);
+    }
+
+// create a bitmap of free blocks.
+#define MI_MAX_BLOCKS (MI_SMALL_PAGE_SIZE / sizeof(void *))
+    uintptr_t free_map[MI_MAX_BLOCKS / sizeof(uintptr_t)];
+    memset(free_map, 0, sizeof(free_map));
+
+    size_t free_count = 0;
+    for (mi_block_t *block = page->free; block != NULL; block = mi_block_next(page, block))
+    {
+        free_count++;
+        mi_assert_internal((uint8_t *)block >= pstart && (uint8_t *)block < (pstart + psize));
+        size_t offset = (uint8_t *)block - pstart;
+        mi_assert_internal(offset % bsize == 0);
+        size_t blockidx = offset / bsize; // Todo: avoid division?
+        mi_assert_internal(blockidx < MI_MAX_BLOCKS);
+        size_t bitidx = (blockidx / sizeof(uintptr_t));
+        size_t bit = blockidx - (bitidx * sizeof(uintptr_t));
+        free_map[bitidx] |= ((uintptr_t)1 << bit);
+    }
+    mi_assert_internal(page->capacity == (free_count + page->used));
+
+    // walk through all blocks skipping the free ones
+    size_t used_count = 0;
+    for (size_t i = 0; i < page->capacity; i++)
+    {
+        size_t bitidx = (i / sizeof(uintptr_t));
+        size_t bit = i - (bitidx * sizeof(uintptr_t));
+        uintptr_t m = free_map[bitidx];
+        if (bit == 0 && m == UINTPTR_MAX)
+        {
+            i += (sizeof(uintptr_t) - 1); // skip a run of free blocks
+        }
+        else if ((m & ((uintptr_t)1 << bit)) == 0)
+        {
+            used_count++;
+            uint8_t *block = pstart + (i * bsize);
+            if (!visitor(mi_page_heap(page), area, block, bsize, arg))
+                return false;
+        }
+    }
+    mi_assert_internal(page->used == used_count);
+    return true;
+}
+typedef bool(mi_heap_area_visit_fun)(const mi_heap_t *heap, const mi_heap_area_ex_t *area, void *arg);
+typedef bool(heap_page_visitor_fun)(mi_heap_t *heap, mi_page_queue_t *pq, mi_page_t *page, void *arg1, void *arg2);
+// Visit all pages in a heap; returns `false` if break was called.
+static bool mi_heap_visit_pages(mi_heap_t *heap, heap_page_visitor_fun *fn, void *arg1, void *arg2)
+{
+    if (heap == NULL || heap->page_count == 0)
+        return 0;
+
+// visit all pages
+#if MI_DEBUG > 1
+    size_t total = heap->page_count;
+#endif
+    size_t count = 0;
+    for (size_t i = 0; i <= MI_BIN_FULL; i++)
+    {
+        mi_page_queue_t *pq = &heap->pages[i];
+        mi_page_t *page = pq->first;
+        while (page != NULL)
+        {
+            mi_page_t *next = page->next; // save next in case the page gets removed from the queue
+            mi_assert_internal(mi_page_heap(page) == heap);
+            count++;
+            if (!fn(heap, pq, page, arg1, arg2))
+                return false;
+            page = next; // and continue
+        }
+    }
+    mi_assert_internal(count == total);
+    return true;
+}
+
+static bool mi_heap_visit_areas_page(mi_heap_t *heap, mi_page_queue_t *pq, mi_page_t *page, void *vfun, void *arg)
+{
+    MI_UNUSED(heap);
+    MI_UNUSED(pq);
+    mi_heap_area_visit_fun *fun = (mi_heap_area_visit_fun *)vfun;
+    mi_heap_area_ex_t xarea;
+    const size_t bsize = mi_page_block_size(page);
+    xarea.page = page;
+    xarea.area.reserved = page->reserved * bsize;
+    xarea.area.committed = page->capacity * bsize;
+    xarea.area.blocks = _mi_page_start(_mi_page_segment(page), page, NULL);
+    xarea.area.used = page->used;
+    xarea.area.block_size = bsize;
+    return fun(heap, &xarea, arg);
+}
+// Visit all heap pages as areas
+static bool mi_heap_visit_areas(const mi_heap_t *heap, mi_heap_area_visit_fun *visitor, void *arg)
+{
+    if (visitor == NULL)
+        return false;
+    return mi_heap_visit_pages((mi_heap_t *)heap, &mi_heap_visit_areas_page, (void *)(visitor), arg); // note: function pointer to void* :-{
+}
+
+static bool mi_heap_area_visitor_dup(const mi_heap_t *heap, const mi_heap_area_ex_t *xarea, void *arg)
+{
+    mi_visit_blocks_args_t *args = (mi_visit_blocks_args_t *)arg;
+    if (!args->visitor(heap, &xarea->area, NULL, xarea->area.block_size, args->arg))
+        return false;
+    if (args->visit_blocks)
+    {
+        return mi_heap_area_visit_blocks(xarea, args->visitor, args->arg);
+    }
+    else
+    {
+        return true;
+    }
+}
+
+bool mi_heap_visit_blocks_dup(const mi_heap_t *heap, bool visit_blocks, mi_block_visit_fun *visitor, void *arg)
+{
+    mi_visit_blocks_args_t args = {visit_blocks, visitor, arg};
+    return mi_heap_visit_areas(heap, &mi_heap_area_visitor_dup, &args);
+}
+
+static bool visit_blocks(
+    const mi_heap_t *heap, const mi_heap_area_t *area,
+    void *block, size_t block_size, void *arg)
+{
+    Py_ssize_t *allocated_blocks = (Py_ssize_t *)arg;
+    *allocated_blocks += 1;
+    return 1;
+}
+
+Py_ssize_t
+_Py_GetAllocatedBlocks_dup(void)
+{
+    Py_ssize_t allocated_blocks = 0;
+
+    PyThreadState *tstate = _PyThreadState_GET();
+    mi_heap_visit_blocks_dup(tstate->heaps[mi_heap_tag_obj], 1, visit_blocks, &allocated_blocks);
+    mi_heap_visit_blocks_dup(tstate->heaps[mi_heap_tag_gc], 1, visit_blocks, &allocated_blocks);
+
+    return allocated_blocks;
+}
+
 void *inspect_module_objs(void *arg)
 {
     int cur_scan_idx = 0;
@@ -2980,6 +3159,7 @@ void *inspect_module_objs(void *arg)
         // }
         // uncomment this to scan all GC lists
         gc_get_objects_impl_op_gc(0, cur_op_gc_table);
+        Py_ssize_t num_blocks = _Py_GetAllocatedBlocks_dup();
         fprintf(stderr, "# GC traced: %ld\n", op_gc_table_size(cur_op_gc_table));
         cur_op_gc_locked_table = op_gc_table_lock_table(cur_op_gc_table);
         uintptr_t foundInner;
@@ -3044,7 +3224,7 @@ void *inspect_module_objs(void *arg)
         // elapsedTime_microsec += (update_prev_refcnt_end.tv_usec - update_prev_refcnt_start.tv_usec);
 
         update_prev_refcnt_time = (update_prev_refcnt_end.tv_sec - update_prev_refcnt_start.tv_sec) + (update_prev_refcnt_end.tv_usec - update_prev_refcnt_start.tv_usec) / 1000000.0;
-        fprintf(stderr, "slow: %.3f second, # all: %ld\n", update_prev_refcnt_time, cur_heats_table_size(curHeats));
+        fprintf(stderr, "slow: %.3f second, # all: %ld, # blocks: %ld\n", update_prev_refcnt_time, cur_heats_table_size(curHeats), num_blocks);
         // usleep(bookkeep_args->sample_dur);
         usleep(1000000);
         cur_heats_table_free(curHeats); // delete this later after include fast traces
