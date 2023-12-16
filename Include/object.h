@@ -505,6 +505,7 @@ given type object has a specified feature.
     static _Py_ALWAYS_INLINE void
     _Py_INCREF(PyObject *op)
     {
+        op->hotness++;
         uint32_t local = _Py_atomic_load_uint32_relaxed(&op->ob_ref_local);
         if (_Py_REF_IS_IMMORTAL(local))
         {
@@ -523,7 +524,6 @@ given type object has a specified feature.
         {
             _Py_IncRefShared(op);
         }
-        op->hotness++;
     }
 
 #define Py_INCREF(op) _Py_INCREF(_PyObject_CAST(op))
@@ -560,6 +560,7 @@ given type object has a specified feature.
 #endif
         PyObject *op)
     {
+        op->hotness++;
         uint32_t local = _Py_atomic_load_uint32_relaxed(&op->ob_ref_local);
         if (_PY_UNLIKELY(_Py_REF_IS_IMMORTAL(local)))
         {
@@ -569,7 +570,6 @@ given type object has a specified feature.
 #ifdef Py_REF_DEBUG
         _Py_DecRefTotal();
 #endif
-        op->hotness++;
         if (_PY_LIKELY(_Py_ThreadLocal(op)))
         {
 #ifdef Py_REF_DEBUG
@@ -937,18 +937,11 @@ given type object has a specified feature.
         return Py_IS_TYPE(op, &PyType_Type);
     }
 #define PyType_CheckExact(op) _PyType_CheckExact(_PyObject_CAST(op))
-    typedef struct
-    {
-        unsigned int sample_dur;
-        FILE *fd;
-        unsigned int doIO;
-        int rescan_thresh;
-    } BookkeepArgs;
-    extern BookkeepArgs bookkeepArgs;
-    PyAPI_DATA(BookkeepArgs) bookkeepArgs;
+
     PyAPI_FUNC(void *) inspect_module_objs(void *arg);
     extern volatile short terminate_flag_refchain;
     PyAPI_DATA(volatile short) terminate_flag_refchain;
+    PyAPI_FUNC(void *) use_pref_cnt_modified(void *arg);
 #ifdef __cplusplus
 }
 #endif

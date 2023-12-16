@@ -1879,6 +1879,7 @@ _Py_NewReference(PyObject *op)
     op->ob_tid = _Py_ThreadId();
     op->ob_ref_local = (1 << _Py_REF_LOCAL_SHIFT);
     op->ob_ref_shared = 0;
+    op->hotness = 0;
 #ifdef Py_TRACE_REFS
     _Py_AddToAllObjects(op, 1);
 #endif

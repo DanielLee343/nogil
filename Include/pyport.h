@@ -1,3 +1,4 @@
+#pragma once
 #ifndef Py_PYPORT_H
 #define Py_PYPORT_H
 

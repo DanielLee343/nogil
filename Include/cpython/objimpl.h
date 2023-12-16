@@ -7,7 +7,6 @@ extern "C" {
 #endif
 
 #define _PyObject_SIZE(typeobj) ( (typeobj)->tp_basicsize )
-
 /* _PyObject_VAR_SIZE returns the number of bytes (as size_t) allocated for a
    vrbl-size object with nitems items, exclusive of gc overhead (if any).  The
    value is rounded up to the closest multiple of sizeof(void *), in order to
@@ -65,7 +64,6 @@ static inline PyObject*
 _PyObject_INIT(PyObject *op, PyTypeObject *typeobj)
 {
     assert(op != NULL);
-    op->hotness = 0;
     Py_SET_TYPE(op, typeobj);
     if (PyType_GetFlags(typeobj) & Py_TPFLAGS_HEAPTYPE) {
         Py_INCREF(typeobj);

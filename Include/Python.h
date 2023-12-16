@@ -114,6 +114,8 @@
 #include "pystate.h"
 #include "cpython/critical_section.h"
 
+#include "bookkeep.h"
+
 #include "codecs.h"
 #include "pyerrors.h"
 #include "pythread.h"

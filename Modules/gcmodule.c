@@ -2825,7 +2825,7 @@ void update_recursive(PyObject *each_op, cur_heats_table *table)
         {
             continue;
         }
-        inner_op->hotness = 0;
+        // inner_op->hotness = 0;
         update_recursive(inner_op, table);
         Py_DECREF(inner_op);
     }
@@ -2917,6 +2917,7 @@ typedef struct mi_visit_blocks_args_s
     mi_block_visit_fun *visitor;
     void *arg;
 } mi_visit_blocks_args_t;
+
 typedef struct mi_heap_area_ex_s
 {
     mi_heap_area_t area;
@@ -2969,6 +2970,7 @@ static bool mi_heap_area_visit_blocks(const mi_heap_area_ex_t *xarea, mi_block_v
         free_map[bitidx] |= ((uintptr_t)1 << bit);
     }
     mi_assert_internal(page->capacity == (free_count + page->used));
+    // fprintf(stderr, "free_count: %zu\n", free_count);
 
     // walk through all blocks skipping the free ones
     size_t used_count = 0;
@@ -2990,12 +2992,13 @@ static bool mi_heap_area_visit_blocks(const mi_heap_area_ex_t *xarea, mi_block_v
         }
     }
     mi_assert_internal(page->used == used_count);
+    // fprintf(stderr, "used_count: %zu\n", used_count);
     return true;
 }
 typedef bool(mi_heap_area_visit_fun)(const mi_heap_t *heap, const mi_heap_area_ex_t *area, void *arg);
 typedef bool(heap_page_visitor_fun)(mi_heap_t *heap, mi_page_queue_t *pq, mi_page_t *page, void *arg1, void *arg2);
 // Visit all pages in a heap; returns `false` if break was called.
-static bool mi_heap_visit_pages(mi_heap_t *heap, heap_page_visitor_fun *fn, void *arg1, void *arg2)
+static bool mi_heap_visit_pages_dup(mi_heap_t *heap, heap_page_visitor_fun *fn, void *arg1, void *arg2)
 {
     if (heap == NULL || heap->page_count == 0)
         return 0;
@@ -3019,6 +3022,7 @@ static bool mi_heap_visit_pages(mi_heap_t *heap, heap_page_visitor_fun *fn, void
             page = next; // and continue
         }
     }
+    fprintf(stderr, "count: %zu\n", count);
     mi_assert_internal(count == total);
     return true;
 }
@@ -3043,7 +3047,7 @@ static bool mi_heap_visit_areas(const mi_heap_t *heap, mi_heap_area_visit_fun *v
 {
     if (visitor == NULL)
         return false;
-    return mi_heap_visit_pages((mi_heap_t *)heap, &mi_heap_visit_areas_page, (void *)(visitor), arg); // note: function pointer to void* :-{
+    return mi_heap_visit_pages_dup((mi_heap_t *)heap, &mi_heap_visit_areas_page, (void *)(visitor), arg); // note: function pointer to void* :-{
 }
 
 static bool mi_heap_area_visitor_dup(const mi_heap_t *heap, const mi_heap_area_ex_t *xarea, void *arg)
@@ -3067,25 +3071,49 @@ bool mi_heap_visit_blocks_dup(const mi_heap_t *heap, bool visit_blocks, mi_block
     return mi_heap_visit_areas(heap, &mi_heap_area_visitor_dup, &args);
 }
 
-static bool visit_blocks(
+// typedef struct all_objs_struct
+// {
+//     Py_ssize_t allocated_blocks;
+//     op_gc_table *table;
+// } all_objs_struct;
+
+static bool visit_blocks( // visitor
     const mi_heap_t *heap, const mi_heap_area_t *area,
     void *block, size_t block_size, void *arg)
 {
-    Py_ssize_t *allocated_blocks = (Py_ssize_t *)arg;
-    *allocated_blocks += 1;
+    // Py_ssize_t *allocated_blocks = (Py_ssize_t *)arg;
+    // *allocated_blocks += 1;
+    if (!block)
+        return 1;
+    all_objs_struct *all_objs = (all_objs_struct *)arg;
+    all_objs->allocated_blocks += 1;
+    PyObject *op = (PyObject *)block;
+    // Py_ssize_t cur_refcnt = Py_REFCNT(op); // works fine
+    // op->hotness = 0; // doesn't work
+    // uint32_t cur_hotness = op->hotness; // works
+    // uint8_t dummy_value = 0;
+    // uintptr_t block_ptr_casted = (uintptr_t)block;
+    // op_gc_table_insert(all_objs->table, &block_ptr_casted, &dummy_value);
     return 1;
 }
 
-Py_ssize_t
-_Py_GetAllocatedBlocks_dup(void)
+// Py_ssize_t
+void _Py_GetAllocatedBlocks_dup(PyThreadState *tstate, op_gc_table *table)
 {
-    Py_ssize_t allocated_blocks = 0;
+    // Py_ssize_t allocated_blocks = 0;
+    all_objs_struct *all_objs = malloc(sizeof(all_objs_struct));
+    all_objs->allocated_blocks = 0;
+    all_objs->table = table;
 
-    PyThreadState *tstate = _PyThreadState_GET();
-    mi_heap_visit_blocks_dup(tstate->heaps[mi_heap_tag_obj], 1, visit_blocks, &allocated_blocks);
-    mi_heap_visit_blocks_dup(tstate->heaps[mi_heap_tag_gc], 1, visit_blocks, &allocated_blocks);
+    // PyThreadState *tstate = _PyThreadState_GET();
+    // fprintf(stderr, "mi_heap_tag_obj count %zu\n", tstate->heaps[mi_heap_tag_obj]->page_count);
+    // fprintf(stderr, "mi_heap_tag_gc count %zu\n", tstate->heaps[mi_heap_tag_gc]->page_count); // for debugging
+    mi_heap_visit_blocks_dup(tstate->heaps[mi_heap_tag_obj], 1, visit_blocks, all_objs);
+    mi_heap_visit_blocks_dup(tstate->heaps[mi_heap_tag_gc], 1, visit_blocks, all_objs);
 
-    return allocated_blocks;
+    fprintf(stderr, "allocated_blocks: %zu, size of op: %zu\n", all_objs->allocated_blocks, cur_heats_table_size(all_objs->table));
+
+    // return allocated_blocks;
 }
 
 void *inspect_module_objs(void *arg)
@@ -3101,6 +3129,7 @@ void *inspect_module_objs(void *arg)
     ts_blob outter_key_wrapper;
     cur_heats_table *curHeats = NULL;
     cur_heats_table_locked_table *curHeats_locked = NULL;
+    // op_gc_table_locked_table *cur_op_gc_locked_table = NULL;
     uintptr_t prev_changed_max = 0;
     uintptr_t prev_changed_min = ULONG_MAX;
     uintptr_t no_93_upper = 100000000000000;
@@ -3110,7 +3139,10 @@ void *inspect_module_objs(void *arg)
     struct timeval update_prev_refcnt_start, update_prev_refcnt_end;
     double update_prev_refcnt_time = 0.0, total_hold_GIL_time = 0.0, whole_IO_time = 0.0, total_capture_hotness_time = 0.0;
     int actual_sleep_dur = 0;
-    op_gc_table *cur_op_gc_table;
+    PyThreadState *mainState = bookkeep_args->mainThreadState;
+    // fprintf(stderr, "inside: %p\n", mainState);
+    // fprintf(stderr, "inside tag_obj count %zu\n", mainState->heaps[mi_heap_tag_obj]->page_count);
+    // fprintf(stderr, "inside tag_gc count %zu\n", mainState->heaps[mi_heap_tag_gc]->page_count);
 
     gstate = PyGILState_Ensure();
     PyObject *module_to_exclude = PyImport_ImportModule("io");
@@ -3126,12 +3158,10 @@ void *inspect_module_objs(void *arg)
         gettimeofday(&update_prev_refcnt_start, NULL);
         curHeats = cur_heats_table_init(0); // only init curHeats at slow scan
         total_slow_num += 1;
-        op_gc_table_locked_table *cur_op_gc_locked_table;
-        cur_op_gc_table = op_gc_table_init(0);
         fprintf(stderr, "slow peeking...\n");
         gstate = PyGILState_Ensure();
-        // _PyMutex_lock(&_PyRuntime.stoptheworld_mutex);
-        // _PyRuntimeState_StopTheWorld(&_PyRuntime);
+        _PyMutex_lock(&_PyRuntime.stoptheworld_mutex);
+        _PyRuntimeState_StopTheWorld(&_PyRuntime); // needs gil held
         // if (cur_slow_idx == 0)
         // { // trace all gens
         //     gc_get_objects_impl_op_gc(-1, cur_op_gc_table);
@@ -3158,55 +3188,60 @@ void *inspect_module_objs(void *arg)
         //     gc_get_objects_impl_op_gc(4, cur_op_gc_table);
         // }
         // uncomment this to scan all GC lists
-        gc_get_objects_impl_op_gc(0, cur_op_gc_table);
-        Py_ssize_t num_blocks = _Py_GetAllocatedBlocks_dup();
-        fprintf(stderr, "# GC traced: %ld\n", op_gc_table_size(cur_op_gc_table));
-        cur_op_gc_locked_table = op_gc_table_lock_table(cur_op_gc_table);
-        uintptr_t foundInner;
-        op_gc_table_iterator *op_gc_it = op_gc_table_locked_table_begin(cur_op_gc_locked_table);
-        op_gc_table_iterator *op_gc_end = op_gc_table_locked_table_end(cur_op_gc_locked_table);
-        Temperature dummy_temp = {
-            .prev_refcnt = 0, // Initialize prev_refcnt
-            .diffs = {0},     // Initialize all elements of diffs to 0
-            .cur_sizeof = 0   // Example: Initialize cur_sizeof to the size of the Temperature struct
-        };
-        for (; !op_gc_table_iterator_equal(op_gc_it, op_gc_end); op_gc_table_iterator_increment(op_gc_it))
-        {
-            foundInner = *op_gc_table_iterator_key(op_gc_it);
+        // gc_get_objects_impl_op_gc(0, cur_op_gc_table);
+        // Py_ssize_t num_blocks = 0;
+        _Py_GetAllocatedBlocks_((void *)mainState, (void *)curHeats);
+        fprintf(stderr, "# GC traced: %ld\n", cur_heats_table_size(curHeats));
+        // uintptr_t foundInner;
+        // op_gc_table_iterator *op_gc_it = op_gc_table_locked_table_begin(cur_op_gc_locked_table);
+        // op_gc_table_iterator *op_gc_end = op_gc_table_locked_table_end(cur_op_gc_locked_table);
+        // Temperature dummy_temp = {
+        //     .prev_refcnt = 0, // Initialize prev_refcnt
+        //     .diffs = {0},     // Initialize all elements of diffs to 0
+        //     .cur_sizeof = 0   // Example: Initialize cur_sizeof to the size of the Temperature struct
+        // };
+        // for (; !op_gc_table_iterator_equal(op_gc_it, op_gc_end); op_gc_table_iterator_increment(op_gc_it))
+        // {
+        //     foundInner = *op_gc_table_iterator_key(op_gc_it);
+        //     // if (!foundInner)
+        //     //     continue;
 
-            PyObject *container_op = (PyObject *)foundInner;
-            // if (_Py_IsImmortal(container_op))
-            // {
-            //     fprintf(stderr, "skipping from immortal %ld\n", foundInner);
-            //     continue;
-            // } // this doesn't work, because the type is immutable, not the object
-            // if (check_object_type(container_op, module_to_exclude) == 1)
-            // {
-            //     fprintf(stderr, "skipping IO type %ld, type: %s\n", foundInner, container_op->ob_type->tp_name);
-            //     continue;
-            // }
-            // PyTypeObject *cur_type = Py_TYPE(container_op);
-            // if (cur_type->tp_flags & Py_TPFLAGS_IMMUTABLETYPE)
-            // {
-            //     // fprintf(stderr, "Type is immutable.\n");
-            //     continue;
-            // } // this filters out a lot of objs
-            // PyObject_Print(container_op, stderr, 1);
+        //     PyObject *container_op = (PyObject *)foundInner;
+        //     // if (_Py_IsImmortal(container_op))
+        //     // {
+        //     //     fprintf(stderr, "skipping from immortal %ld\n", foundInner);
+        //     //     continue;
+        //     // } // this doesn't work, because the type is immutable, not the object
+        //     // if (check_object_type(container_op, module_to_exclude) == 1)
+        //     // {
+        //     //     fprintf(stderr, "skipping IO type %ld, type: %s\n", foundInner, container_op->ob_type->tp_name);
+        //     //     continue;
+        //     // }
+        //     // PyTypeObject *cur_type = Py_TYPE(container_op); // works fine
+        //     // if (cur_type->tp_flags & Py_TPFLAGS_IMMUTABLETYPE)
+        //     // {
+        //     //     // fprintf(stderr, "Type is immutable.\n");
+        //     //     continue;
+        //     // } // this filters out a lot of objs
+        //     // PyObject_Print(container_op, stderr, 1);
+        //     uint32_t hotness = container_op->hotness;
+        //     // cur_heats_table_insert(curHeats, &foundInner, &dummy_temp);
+        //     // container_op->hotness = 0; // added for hotness
+        //     // fprintf(stderr, "%ld: ", foundInner);
+        //     // update_recursive(container_op, curHeats);
+        //     // update_recursive_tuple(container_op, curHeats);
+        //     // PyObject *py_list = gc_get_referents(NULL, container_op);
+        // }
+        // op_gc_table_iterator_free(op_gc_end);
+        // op_gc_table_iterator_free(op_gc_it);
+        // op_gc_table_locked_table_free(cur_op_gc_locked_table);
+        cur_heats_table_free(curHeats);
 
-            cur_heats_table_insert(curHeats, &foundInner, &dummy_temp);
-            container_op->hotness = 0; // added for hotness
-            // fprintf(stderr, "%ld: ", foundInner);
-            // update_recursive(container_op, curHeats);
-            // update_recursive_tuple(container_op, curHeats);
-            // PyObject *py_list = gc_get_referents(NULL, container_op);
-        }
         PyGILState_Release(gstate);
-        // _PyRuntimeState_StartTheWorld(&_PyRuntime);
-        // _PyMutex_unlock(&_PyRuntime.stoptheworld_mutex);
-        op_gc_table_iterator_free(op_gc_end);
-        op_gc_table_iterator_free(op_gc_it);
-        op_gc_table_locked_table_free(cur_op_gc_locked_table);
-        op_gc_table_free(cur_op_gc_table);
+        _PyRuntimeState_StartTheWorld(&_PyRuntime);
+        _PyMutex_unlock(&_PyRuntime.stoptheworld_mutex);
+
+        // op_gc_table_free(cur_op_gc_table);
         outter_key_wrapper.cur_slow_idx = cur_slow_idx;
         if (++cur_slow_idx == 4)
         {
@@ -3224,12 +3259,278 @@ void *inspect_module_objs(void *arg)
         // elapsedTime_microsec += (update_prev_refcnt_end.tv_usec - update_prev_refcnt_start.tv_usec);
 
         update_prev_refcnt_time = (update_prev_refcnt_end.tv_sec - update_prev_refcnt_start.tv_sec) + (update_prev_refcnt_end.tv_usec - update_prev_refcnt_start.tv_usec) / 1000000.0;
-        fprintf(stderr, "slow: %.3f second, # all: %ld, # blocks: %ld\n", update_prev_refcnt_time, cur_heats_table_size(curHeats), num_blocks);
+        fprintf(stderr, "slow: %.3f second, # all: %ld\n", update_prev_refcnt_time, cur_heats_table_size(curHeats));
         // usleep(bookkeep_args->sample_dur);
         usleep(1000000);
-        cur_heats_table_free(curHeats); // delete this later after include fast traces
     }
     Py_DECREF(module_to_exclude);
     terminate_flag_refchain = 0;
     fprintf(stderr, "finish bookkeeping, shutdown\n");
+}
+
+void *use_pref_cnt_modified(void *arg)
+{
+    int cur_slow_idx = 0;
+    int cur_scan_idx = 0;
+    BookkeepArgs *bookkeep_args = (BookkeepArgs *)arg;
+    unsigned int doIO_ = bookkeep_args->doIO;
+    struct timespec ts;
+    PyGILState_STATE gstate;
+    all_heats_table *allHeats = all_heats_table_init(0);
+    all_heats_table_locked_table *allHeats_locked = NULL;
+    ts_blob outter_key_wrapper;
+    cur_heats_table *curHeats = NULL;
+    cur_heats_table_locked_table *curHeats_locked = NULL;
+    // op_gc_table_locked_table *cur_op_gc_locked_table = NULL;
+    uintptr_t prev_changed_max = 0;
+    uintptr_t prev_changed_min = ULONG_MAX;
+    uintptr_t no_93_upper = 100000000000000;
+    int rescan_thresh = bookkeep_args->rescan_thresh;
+    int total_fast_num = 0, total_slow_num = 0;
+    clock_t IO_start, IO_end;
+    struct timeval update_prev_refcnt_start, update_prev_refcnt_end, whole_start, whole_end;
+    double update_prev_refcnt_time = 0.0, total_hold_GIL_time = 0.0, whole_IO_time = 0.0, total_capture_hotness_time = 0.0;
+    int actual_sleep_dur = 0;
+    PyThreadState *mainState = bookkeep_args->mainThreadState;
+    op_gc_table *changed_op;
+    double whole_time = 0.0;
+    gettimeofday(&whole_start, NULL);
+    while (!terminate_flag_refchain)
+    {
+        unsigned int elapsedTime_microsec;
+        gettimeofday(&update_prev_refcnt_start, NULL);
+        if (cur_scan_idx == 0)
+        {
+            // reset_slow:
+            changed_op = op_gc_table_init(0);   // to store objs refcnt get changed
+            curHeats = cur_heats_table_init(0); // only init in slow
+            total_slow_num += 1;
+            fprintf(stderr, "slow peeking...\n");
+            gstate = PyGILState_Ensure();
+            _PyMutex_lock(&_PyRuntime.stoptheworld_mutex);
+            _PyRuntimeState_StopTheWorld(&_PyRuntime); // needs gil held
+
+            _Py_GetAllocatedBlocks_((void *)mainState, (void *)curHeats);
+            fprintf(stderr, "# GC traced: %ld\n", cur_heats_table_size(curHeats));
+
+            _PyRuntimeState_StartTheWorld(&_PyRuntime);
+            _PyMutex_unlock(&_PyRuntime.stoptheworld_mutex);
+            PyGILState_Release(gstate);
+
+            // if (cur_heats_table_size(curHeats) < 10) // unlikely
+            // {
+            //     fprintf(stderr, "rolling back from slow, this block shouldn't be reached\n");
+            //     usleep(bookkeep_args->sample_dur);
+            //     goto reset_slow;
+            // }
+            outter_key_wrapper.cur_slow_idx = cur_slow_idx;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            outter_key_wrapper.ts = ts;
+            uintptr_t curHeats_casted = (uintptr_t)curHeats;
+            all_heats_table_insert(allHeats, &outter_key_wrapper, &curHeats_casted);
+        }
+        else // fast
+        {
+            total_fast_num += 1;
+            uint8_t dummy_val_changed = 0;
+            uintptr_t foundInner;
+            Temperature *temp_ptr;
+            cur_heats_table_iterator *curHeats_it, *curHeats_end;
+            curHeats_locked = cur_heats_table_lock_table(curHeats);
+            curHeats_it = cur_heats_table_locked_table_begin(curHeats_locked);
+            curHeats_end = cur_heats_table_locked_table_end(curHeats_locked);
+            cur_heats_table_locked_table_unlock(curHeats_locked);
+            if (PyGILState_Check())
+                fprintf(stderr, "GIL held, which shouldn't!\n");
+            if (cur_scan_idx == 1)
+            {
+                for (; !cur_heats_table_iterator_equal(curHeats_it, curHeats_end); cur_heats_table_iterator_increment(curHeats_it))
+                {
+                    foundInner = *cur_heats_table_iterator_key(curHeats_it);
+                    PyObject *op = (PyObject *)foundInner;
+                    temp_ptr = cur_heats_table_iterator_mapped(curHeats_it);
+                    temp_ptr->prev_refcnt = op->hotness;
+                }
+            }
+            else if (cur_scan_idx == 2)
+            {
+                for (; !cur_heats_table_iterator_equal(curHeats_it, curHeats_end);
+                     cur_heats_table_iterator_increment(curHeats_it))
+                {
+                    foundInner = *cur_heats_table_iterator_key(curHeats_it);
+                    PyObject *op = (PyObject *)foundInner;
+                    temp_ptr = cur_heats_table_iterator_mapped(curHeats_it);
+                    temp_ptr->diffs[1] = op->hotness - temp_ptr->prev_refcnt;
+                    if (temp_ptr->diffs[1] != 0)
+                    {
+                        op_gc_table_insert(changed_op, &foundInner, &dummy_val_changed);
+                        // if (foundInner > prev_changed_max)
+                        // {
+                        //     prev_changed_max = foundInner;
+                        // }
+                        // else if (foundInner < prev_changed_min && foundInner > no_93_upper)
+                        // {
+                        //     prev_changed_min = foundInner;
+                        // }
+                    }
+                    temp_ptr->prev_refcnt = op->hotness;
+                }
+            }
+            else if (cur_scan_idx == 3)
+            {
+                // gstate = PyGILState_Ensure();
+                for (; !cur_heats_table_iterator_equal(curHeats_it, curHeats_end);
+                     cur_heats_table_iterator_increment(curHeats_it))
+                {
+                    foundInner = *cur_heats_table_iterator_key(curHeats_it);
+                    // if (foundInner > prev_changed_min && foundInner < prev_changed_max)
+                    // {
+                    PyObject *op = (PyObject *)foundInner;
+                    temp_ptr = cur_heats_table_iterator_mapped(curHeats_it);
+                    temp_ptr->diffs[2] = op->hotness - temp_ptr->prev_refcnt;
+                    if (temp_ptr->diffs[2] != 0)
+                    {
+                        op_gc_table_insert(changed_op, &foundInner, &dummy_val_changed);
+                    }
+                    temp_ptr->prev_refcnt = op->hotness;
+                    // }
+                    // else
+                    // {
+                    //     cur_heats_table_erase(curHeats, &foundInner);
+                    // }
+                }
+                // PyGILState_Release(gstate);// not sure why I did this
+            }
+            else
+            {
+                for (; !cur_heats_table_iterator_equal(curHeats_it, curHeats_end); cur_heats_table_iterator_increment(curHeats_it))
+                {
+                    foundInner = *cur_heats_table_iterator_key(curHeats_it);
+                    PyObject *op = (PyObject *)foundInner;
+                    temp_ptr = cur_heats_table_iterator_mapped(curHeats_it);
+                    temp_ptr->diffs[cur_scan_idx - 1] = op->hotness - temp_ptr->prev_refcnt;
+                    if (temp_ptr->diffs[cur_scan_idx - 1] != 0)
+                    {
+                        op_gc_table_insert(changed_op, &foundInner, &dummy_val_changed);
+                    }
+                    temp_ptr->prev_refcnt = op->hotness;
+                }
+            }
+            cur_heats_table_iterator_free(curHeats_end);
+            cur_heats_table_iterator_free(curHeats_it);
+            cur_heats_table_locked_table_free(curHeats_locked);
+            fprintf(stderr, "changed size: %ld\n", op_gc_table_size(changed_op));
+            // usleep(100000);
+        }
+        gettimeofday(&update_prev_refcnt_end, NULL);
+        elapsedTime_microsec = (update_prev_refcnt_end.tv_sec - update_prev_refcnt_start.tv_sec) * 1000000;
+        elapsedTime_microsec += (update_prev_refcnt_end.tv_usec - update_prev_refcnt_start.tv_usec);
+        update_prev_refcnt_time = (update_prev_refcnt_end.tv_sec - update_prev_refcnt_start.tv_sec) + (update_prev_refcnt_end.tv_usec - update_prev_refcnt_start.tv_usec) / 1000000.0;
+        if (cur_scan_idx == 0)
+        {
+            fprintf(stderr, "slow: %.3f second\n", update_prev_refcnt_time);
+            total_hold_GIL_time += update_prev_refcnt_time;
+        }
+        else // fast
+        {
+            total_capture_hotness_time += update_prev_refcnt_time;
+            fprintf(stderr, "fast %d, # size: %ld, bk record time: %.3f second\n", cur_scan_idx, cur_heats_table_size(curHeats), update_prev_refcnt_time);
+            actual_sleep_dur = bookkeep_args->sample_dur - elapsedTime_microsec;
+            if (actual_sleep_dur > 0)
+            {
+                usleep(actual_sleep_dur);
+            }
+        }
+        if (++cur_scan_idx == rescan_thresh)
+        {
+            cur_scan_idx = 0;
+            op_gc_table_free(changed_op);
+            // cur_heats_table_free(curHeats); // delete this later after include fast traces
+        }
+    }
+    if (doIO_)
+    {
+        assert(bookkeep_args->fd != NULL);
+        fprintf(stderr, "doing IO...\n");
+        fflush(stderr);
+        all_heats_table_iterator *allHeats_it, *allHeats_end;
+        cur_heats_table_iterator *curHeats_it, *curHeats_end;
+        IO_start = clock();
+        uintptr_t found_each_cur_heats;
+        uintptr_t foundInner;
+        allHeats_locked = all_heats_table_lock_table(allHeats);
+        allHeats_it = all_heats_table_locked_table_begin(allHeats_locked);
+        allHeats_end = all_heats_table_locked_table_end(allHeats_locked);
+        gstate = PyGILState_Ensure();
+        _PyMutex_lock(&_PyRuntime.stoptheworld_mutex);
+        _PyRuntimeState_StopTheWorld(&_PyRuntime);
+        for (; !all_heats_table_iterator_equal(allHeats_it, allHeats_end); all_heats_table_iterator_increment(allHeats_it))
+        {
+            outter_key_wrapper = *all_heats_table_iterator_key(allHeats_it);
+            found_each_cur_heats = *all_heats_table_iterator_mapped(allHeats_it);
+            curHeats = (cur_heats_table *)found_each_cur_heats;
+            curHeats_locked = cur_heats_table_lock_table(curHeats);
+            // fprintf(stderr, "inner table size is %lu\n", cur_heats_table_locked_table_size(curHeats_locked));
+            // fflush(stderr);
+            curHeats_it = cur_heats_table_locked_table_begin(curHeats_locked);
+            curHeats_end = cur_heats_table_locked_table_end(curHeats_locked);
+            Temperature *temp_ptr;
+            for (; !cur_heats_table_iterator_equal(curHeats_it, curHeats_end);
+                 cur_heats_table_iterator_increment(curHeats_it))
+            {
+                foundInner = *cur_heats_table_iterator_key(curHeats_it);
+                temp_ptr = cur_heats_table_iterator_mapped(curHeats_it);
+                fprintf(bookkeep_args->fd, "%ld.%ld\t%ld",
+                        outter_key_wrapper.ts.tv_sec, outter_key_wrapper.ts.tv_nsec, foundInner);
+                bool if_changed = false;
+                for (int i = 0; i < rescan_thresh - 1; i++)
+                {
+                    if (temp_ptr->diffs[i] != 0)
+                    {
+                        if_changed = true;
+                    }
+                    fprintf(bookkeep_args->fd, "\t%ld", temp_ptr->diffs[i]);
+                }
+                // fprintf(bookkeep_args->fd, "\t%ld\n", temp_ptr->cur_sizeof);
+                if (Py_TYPE(foundInner) && if_changed)
+                {
+                    temp_ptr->cur_sizeof = _PySys_GetSizeOf((PyObject *)foundInner);
+                    fprintf(bookkeep_args->fd, "\t%zu\n", temp_ptr->cur_sizeof);
+                }
+                else
+                {
+                    fprintf(bookkeep_args->fd, "\t0\n");
+                }
+            }
+            cur_heats_table_iterator_free(curHeats_end);
+            cur_heats_table_iterator_free(curHeats_it);
+            cur_heats_table_locked_table_free(curHeats_locked);
+            cur_heats_table_free(curHeats);
+        }
+        _PyRuntimeState_StartTheWorld(&_PyRuntime);
+        _PyMutex_unlock(&_PyRuntime.stoptheworld_mutex);
+        PyGILState_Release(gstate);
+        all_heats_table_iterator_free(allHeats_it);
+        all_heats_table_iterator_free(allHeats_end);
+        IO_end = clock();
+        whole_IO_time = (double)(IO_end - IO_start) / CLOCKS_PER_SEC;
+        fprintf(stderr, "flushing time: %.3f seconds\n", whole_IO_time);
+    }
+    gettimeofday(&whole_end, NULL);
+    whole_time = (whole_end.tv_sec - whole_start.tv_sec) + (whole_end.tv_usec - whole_start.tv_usec) / 1000000.0;
+    double total_weird_time = whole_time - total_hold_GIL_time - total_capture_hotness_time;
+    double avg_hold_GIL_time = total_hold_GIL_time / total_slow_num;
+    fprintf(stderr, "total slow num: %d, avg hold GIL time: %.3f, total hold GIL time: %.3f\n",
+            total_slow_num, avg_hold_GIL_time, total_hold_GIL_time);
+    double avg_update_time = total_capture_hotness_time / total_fast_num;
+    fprintf(stderr, "total_fast_num: %d, avg capture hotness time(no GIL): %.3f, total capture hotness: %.3f\n",
+            total_fast_num, avg_update_time, total_capture_hotness_time);
+    fflush(stderr);
+    fprintf(stderr, "whole weird time: %.3f second\n", total_weird_time);
+
+    all_heats_table_locked_table_free(allHeats_locked);
+    all_heats_table_free(allHeats);
+    terminate_flag_refchain = 0;
+    fprintf(stderr, "finish bookkeeping, shutdown\n");
+    return NULL;
 }

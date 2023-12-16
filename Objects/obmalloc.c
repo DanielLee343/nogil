@@ -8,7 +8,10 @@
 
 #include <stdbool.h>
 #include "mimalloc.h"
-
+#undef CUCKOO_TABLE_NAME
+#undef CUCKOO_KEY_TYPE
+#undef CUCKOO_MAPPED_TYPE
+#include "curHeats.h"
 /* Defined in tracemalloc.c */
 extern void _PyMem_DumpTraceback(int fd, const void *ptr);
 
@@ -717,10 +720,49 @@ _Py_GetAllocatedBlocks(void)
     Py_ssize_t allocated_blocks = 0;
 
     PyThreadState *tstate = _PyThreadState_GET();
-    mi_heap_visit_blocks(tstate->heaps[mi_heap_tag_obj], 1, visit_blocks, &allocated_blocks);
-    mi_heap_visit_blocks(tstate->heaps[mi_heap_tag_gc], 1, visit_blocks, &allocated_blocks);
+    mi_heap_visit_blocks(tstate->heaps[mi_heap_tag_obj], 0, visit_blocks, &allocated_blocks);
+    mi_heap_visit_blocks(tstate->heaps[mi_heap_tag_gc], 0, visit_blocks, &allocated_blocks);
 
     return allocated_blocks;
+}
+
+static bool visit_blocks_( // visitor
+    const mi_heap_t *heap, const mi_heap_area_t *area,
+    void *block, size_t block_size, void *arg)
+{
+    // Py_ssize_t *allocated_blocks = (Py_ssize_t *)arg;
+    // *allocated_blocks += 1;
+    if (!block)
+        return 1;
+    all_objs_struct *all_objs = (all_objs_struct *)arg;
+    all_objs->allocated_blocks += 1;
+    // PyObject *op = (PyObject *)block;
+    // Py_ssize_t cur_refcnt = Py_REFCNT(op); // works fine
+    // uint32_t hotness = op->hotness;        // works fine
+    // fprintf(stderr, "%u\n", hotness);
+    // op->hotness = 0; // segfaults
+    uintptr_t block_ptr_casted = (uintptr_t)block;
+    Temperature new_temp = {
+        .prev_refcnt = 0, // Initialize prev_refcnt
+        .diffs = {0},     // Initialize all elements of diffs to 0
+        .cur_sizeof = 0   // Example: Initialize cur_sizeof to the size of the Temperature struct
+    };
+    cur_heats_table_insert(all_objs->table, &block_ptr_casted, &new_temp);
+    return 1;
+}
+
+void _Py_GetAllocatedBlocks_(void *arg, void *table)
+{
+    all_objs_struct *all_objs = malloc(sizeof(all_objs_struct));
+    all_objs->allocated_blocks = 0;
+    all_objs->table = (cur_heats_table *)table;
+
+    // PyThreadState *tstate = _PyThreadState_GET();
+    PyThreadState *tstate = (PyThreadState *)arg;
+    mi_heap_visit_blocks(tstate->heaps[mi_heap_tag_obj], 1, visit_blocks_, all_objs);
+    mi_heap_visit_blocks(tstate->heaps[mi_heap_tag_gc], 1, visit_blocks_, all_objs);
+
+    fprintf(stderr, "allocated_blocks: %zu, size of op: %zu\n", all_objs->allocated_blocks, cur_heats_table_size(all_objs->table));
 }
 
 /*==========================================================================*/

@@ -1,6 +1,6 @@
 /* Thread and interpreter state structures and their interfaces */
 
-
+#pragma once
 #ifndef Py_PYSTATE_H
 #define Py_PYSTATE_H
 #ifdef __cplusplus
